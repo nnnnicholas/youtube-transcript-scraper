@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+ENV/
+
+# Output directories (don't commit scraped data)
+transcripts/
+*-transcripts/
+output/
+*.json
+!references/*.json
+
+# Temp files
+.temp/
+*.tmp
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
