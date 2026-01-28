@@ -16,15 +16,18 @@ Example:
 import argparse
 import json
 import logging
-import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse, urlunparse
 
 # Configure logging
 logging.basicConfig(
@@ -35,6 +38,13 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Concurrency/rate-limit defaults
+MAX_WORKERS = 3
+MAX_RETRIES = 3
+RATE_LIMIT_BACKOFF_BASE = 10.0  # seconds
+RATE_LIMIT_BACKOFF_MAX = 120.0  # seconds
+MIN_VIDEO_DURATION = 240  # seconds (skip videos shorter than this)
 
 
 @dataclass
@@ -86,22 +96,56 @@ def ensure_yt_dlp_installed() -> bool:
         return False
 
 
-def normalize_channel_url(channel_input: str) -> str:
+def normalize_channel_url(channel_input: str, videos_only: bool = True) -> str:
     """Convert various channel input formats to a consistent URL."""
     # Already a full URL
     if channel_input.startswith("http"):
-        return channel_input
+        if not videos_only:
+            return channel_input
+
+        parsed = urlparse(channel_input)
+        path = parsed.path.rstrip("/")
+
+        # Don't modify explicit subpages or non-channel URLs
+        if any(seg in path for seg in ["/videos", "/shorts", "/streams", "/playlists", "/featured", "/community", "/live", "/releases"]):
+            return channel_input
+        if "/watch" in path or "/playlist" in path or "list=" in parsed.query:
+            return channel_input
+
+        new_path = f"{path}/videos" if path else "/videos"
+        return urlunparse(parsed._replace(path=new_path))
     
     # Channel ID (starts with UC)
     if channel_input.startswith("UC") and len(channel_input) == 24:
-        return f"https://www.youtube.com/channel/{channel_input}"
+        suffix = "/videos" if videos_only else ""
+        return f"https://www.youtube.com/channel/{channel_input}{suffix}"
     
     # Handle @username format
     if channel_input.startswith("@"):
-        return f"https://www.youtube.com/{channel_input}"
+        suffix = "/videos" if videos_only else ""
+        return f"https://www.youtube.com/{channel_input}{suffix}"
     
     # Assume it's a channel name/handle
-    return f"https://www.youtube.com/@{channel_input}"
+    suffix = "/videos" if videos_only else ""
+    return f"https://www.youtube.com/@{channel_input}{suffix}"
+
+
+def is_short_entry(data: dict) -> bool:
+    """Heuristic to identify YouTube Shorts or short-form videos."""
+    for key in ("webpage_url", "url", "original_url"):
+        value = data.get(key)
+        if isinstance(value, str) and "/shorts/" in value:
+            return True
+
+    duration = data.get("duration")
+    if isinstance(duration, (int, float)) and duration > 0 and duration < MIN_VIDEO_DURATION:
+        return True
+
+    title = data.get("title")
+    if isinstance(title, str) and "#short" in title.lower():
+        return True
+
+    return False
 
 
 def get_channel_videos(channel_url: str) -> tuple[Optional[ChannelInfo], list[VideoInfo]]:
@@ -137,11 +181,16 @@ def get_channel_videos(channel_url: str) -> tuple[Optional[ChannelInfo], list[Vi
         videos = []
         channel_info = None
         
+        short_videos_skipped = 0
         for line in result.stdout.strip().split("\n"):
             if not line:
                 continue
             try:
                 data = json.loads(line)
+                
+                if is_short_entry(data):
+                    short_videos_skipped += 1
+                    continue
                 
                 # Extract channel info from first video
                 if channel_info is None and "channel_id" in data:
@@ -172,7 +221,10 @@ def get_channel_videos(channel_url: str) -> tuple[Optional[ChannelInfo], list[Vi
         if channel_info:
             channel_info.video_count = len(videos)
         
-        logger.info(f"Found {len(videos)} videos")
+        if short_videos_skipped:
+            logger.info(f"Found {len(videos)} videos (skipped {short_videos_skipped} short videos)")
+        else:
+            logger.info(f"Found {len(videos)} videos")
         return channel_info, videos
         
     except subprocess.TimeoutExpired:
@@ -183,7 +235,57 @@ def get_channel_videos(channel_url: str) -> tuple[Optional[ChannelInfo], list[Vi
         return None, []
 
 
-def download_transcript(video_id: str, output_path: Path, lang: str = "en") -> tuple[bool, Optional[str], Optional[str]]:
+def is_rate_limit_error(stderr_text: str) -> bool:
+    """Heuristic check for rate limiting in yt-dlp stderr output."""
+    if not stderr_text:
+        return False
+    text = stderr_text.lower()
+    if "429" in text or "too many requests" in text or "rate limit" in text or "temporarily blocked" in text:
+        return True
+    if "http error 403" in text and ("forbidden" in text or "blocked" in text or "access" in text):
+        return True
+    return False
+
+
+def compact_error(text: str, max_len: int = 200) -> str:
+    """Trim verbose errors for logs."""
+    if not text:
+        return "unknown error"
+    text = " ".join(text.split())
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def find_subtitle_file(temp_dir: Path, video_id: str, lang: str) -> Optional[Path]:
+    """Find a subtitle file in a directory for a given video."""
+    subtitle_patterns = [
+        temp_dir / f"{video_id}.{lang}.json3",
+        temp_dir / f"{video_id}.{lang}.vtt",
+        temp_dir / f"{video_id}.{lang}.srt",
+    ]
+
+    # Also check for auto-generated variants
+    for pattern in [f"{video_id}.{lang}*.json3", f"{video_id}*.{lang}.json3"]:
+        subtitle_patterns.extend(temp_dir.glob(pattern))
+
+    for pattern in subtitle_patterns:
+        if isinstance(pattern, Path) and pattern.exists():
+            return pattern
+
+    # Check for any subtitle file for this video
+    for candidate in temp_dir.glob(f"{video_id}*"):
+        if candidate.suffix in [".json3", ".vtt", ".srt"]:
+            return candidate
+
+    return None
+
+
+def download_transcript(
+    video_id: str,
+    output_path: Path,
+    lang: str = "en"
+) -> tuple[bool, Optional[str], Optional[str], bool]:
     """
     Download transcript for a single video.
     
@@ -193,15 +295,70 @@ def download_transcript(video_id: str, output_path: Path, lang: str = "en") -> t
         lang: Preferred language code
     
     Returns:
-        Tuple of (success, transcript_text, error_message)
+        Tuple of (success, transcript_text, error_message, rate_limited)
     """
     video_url = f"https://www.youtube.com/watch?v={video_id}"
     
-    # Create temp directory for subtitle files
-    temp_dir = output_path.parent / ".temp"
-    temp_dir.mkdir(exist_ok=True)
-    
-    # Try to download subtitles (prefer manual, fallback to auto-generated)
+    try:
+        with tempfile.TemporaryDirectory(dir=output_path.parent, prefix=f".temp_{video_id}_") as tmp_dir:
+            temp_dir = Path(tmp_dir)
+
+            # Try to download subtitles (prefer manual, fallback to auto-generated)
+            cmd = [
+                "yt-dlp",
+                "--write-subs",
+                "--write-auto-subs",
+                "--sub-lang", lang,
+                "--sub-format", "json3",
+                "--skip-download",
+                "--no-warnings",
+                "-o", str(temp_dir / "%(id)s.%(ext)s"),
+                video_url
+            ]
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+
+            stderr = (result.stderr or "").strip()
+            rate_limited = is_rate_limit_error(stderr)
+
+            if result.returncode != 0:
+                if rate_limited:
+                    return False, None, f"Rate limited: {compact_error(stderr)}", True
+                return False, None, f"yt-dlp error: {compact_error(stderr)}", False
+
+            subtitle_file = find_subtitle_file(temp_dir, video_id, lang)
+
+            if not subtitle_file:
+                if rate_limited:
+                    return False, None, "Rate limited: no subtitles returned", True
+                return False, None, "No subtitles available", False
+
+            # Parse the subtitle file
+            transcript_text = parse_subtitle_file(subtitle_file)
+
+            if transcript_text:
+                return True, transcript_text, None, False
+            return False, None, "Failed to parse subtitles", False
+
+    except subprocess.TimeoutExpired:
+        return False, None, "Timeout downloading transcript", False
+    except Exception as e:
+        return False, None, str(e), False
+
+
+def run_batch_download(video_urls: list[str], temp_dir: Path, lang: str) -> tuple[bool, bool, Optional[str]]:
+    """Run yt-dlp once to download subtitles for a list of video URLs."""
+    if not video_urls:
+        return True, False, None
+
+    batch_file = temp_dir / "batch_urls.txt"
+    batch_file.write_text("\n".join(video_urls), encoding="utf-8")
+
     cmd = [
         "yt-dlp",
         "--write-subs",
@@ -211,59 +368,30 @@ def download_transcript(video_id: str, output_path: Path, lang: str = "en") -> t
         "--skip-download",
         "--no-warnings",
         "-o", str(temp_dir / "%(id)s.%(ext)s"),
-        video_url
+        "--batch-file", str(batch_file),
     ]
-    
+
+    timeout = max(300, min(7200, 10 * len(video_urls)))
+
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=60
+            timeout=timeout
         )
-        
-        # Look for downloaded subtitle file
-        subtitle_patterns = [
-            temp_dir / f"{video_id}.{lang}.json3",
-            temp_dir / f"{video_id}.{lang}.vtt",
-            temp_dir / f"{video_id}.{lang}.srt",
-        ]
-        
-        # Also check for auto-generated variants
-        for pattern in [f"{video_id}.{lang}*.json3", f"{video_id}*.{lang}.json3"]:
-            subtitle_patterns.extend(temp_dir.glob(pattern))
-        
-        subtitle_file = None
-        for pattern in subtitle_patterns:
-            if isinstance(pattern, Path) and pattern.exists():
-                subtitle_file = pattern
-                break
-        
-        if not subtitle_file:
-            # Check for any subtitle file for this video
-            for f in temp_dir.glob(f"{video_id}*"):
-                if f.suffix in [".json3", ".vtt", ".srt"]:
-                    subtitle_file = f
-                    break
-        
-        if not subtitle_file:
-            return False, None, "No subtitles available"
-        
-        # Parse the subtitle file
-        transcript_text = parse_subtitle_file(subtitle_file)
-        
-        # Clean up temp file
-        subtitle_file.unlink()
-        
-        if transcript_text:
-            return True, transcript_text, None
-        else:
-            return False, None, "Failed to parse subtitles"
-            
     except subprocess.TimeoutExpired:
-        return False, None, "Timeout downloading transcript"
-    except Exception as e:
-        return False, None, str(e)
+        return False, False, "Timeout downloading batch transcripts"
+
+    stderr = (result.stderr or "").strip()
+    rate_limited = is_rate_limit_error(stderr)
+
+    if result.returncode != 0:
+        if rate_limited:
+            return False, True, f"Rate limited: {compact_error(stderr)}"
+        return False, False, f"yt-dlp error: {compact_error(stderr)}"
+
+    return True, rate_limited, None
 
 
 def parse_subtitle_file(filepath: Path) -> Optional[str]:
@@ -357,19 +485,20 @@ def scrape_channel(
     lang: str = "en",
     resume: bool = True,
     delay: float = 1.0,
-    skip_shorts: bool = True
+    max_workers: int = MAX_WORKERS,
+    mode: str = "per-video"
 ) -> dict:
     """
     Main function to scrape all transcripts from a channel.
-
+    
     Args:
         channel_url: YouTube channel URL or ID
         output_dir: Directory to save transcripts
         lang: Preferred language code
         resume: Skip already downloaded transcripts
         delay: Delay between requests (seconds)
-        skip_shorts: Skip YouTube Shorts (videos < 90s or with #short in title)
-
+        mode: "per-video" (parallel) or "batch" (single yt-dlp run)
+    
     Returns:
         Summary dict with results
     """
@@ -413,81 +542,229 @@ def scrape_channel(
         "success": 0,
         "no_transcript": 0,
         "error": 0,
-        "skipped": 0,
-        "shorts_skipped": 0
+        "skipped": 0
     }
-
+    
     processed_videos = {}
 
-    for i, video in enumerate(videos, 1):
-        # Skip YouTube Shorts
-        if skip_shorts:
-            is_short = False
-            title_lower = video.title.lower()
-            if "#short" in title_lower or "#shorts" in title_lower:
-                is_short = True
-            elif video.duration and video.duration < 90:
-                is_short = True
+    pending_videos = deque()
+    processed_count = 0
 
-            if is_short:
-                logger.info(f"[{i}/{len(videos)}] Skipping short: {video.title[:50]}...")
-                results["shorts_skipped"] += 1
-                continue
-
-        logger.info(f"[{i}/{len(videos)}] Processing: {video.title[:50]}...")
-
+    for video in videos:
         # Check if already processed
         if resume and video.id in existing_index.get("videos", {}):
             prev_status = existing_index["videos"][video.id].get("transcript_status")
             if prev_status == "success":
-                logger.info(f"  Skipping (already downloaded)")
+                logger.info(f"Skipping (already downloaded): {video.title[:50]}")
                 results["skipped"] += 1
                 processed_videos[video.id] = existing_index["videos"][video.id]
+                processed_count += 1
+                if processed_count % 10 == 0:
+                    save_index(index_path, channel_info, processed_videos, results)
                 continue
-        
-        # Download transcript
-        transcript_path = transcripts_dir / f"{video.id}.json"
-        success, transcript, error = download_transcript(video.id, transcript_path, lang)
-        
-        if success and transcript:
-            video.transcript_status = "success"
-            
-            # Save transcript with metadata
-            transcript_data = {
-                "video_id": video.id,
-                "title": video.title,
-                "url": video.url,
-                "upload_date": video.upload_date,
-                "duration": video.duration,
+
+        pending_videos.append(video)
+
+    if mode == "batch":
+        if delay > 0:
+            logger.info("Batch mode ignores --delay (single yt-dlp run per attempt)")
+
+        remaining = list(pending_videos)
+        attempt = 0
+        rate_limit_hits = 0
+
+        while remaining:
+            attempt += 1
+            with tempfile.TemporaryDirectory(dir=output_dir, prefix=".batch_subs_") as tmp_dir:
+                temp_dir = Path(tmp_dir)
+                video_urls = [video.url for video in remaining]
+                ok, rate_limited, batch_error = run_batch_download(video_urls, temp_dir, lang)
+
+                if batch_error:
+                    logger.warning(f"Batch download issue: {batch_error}")
+
+                retry_list = []
+                for video in remaining:
+                    subtitle_file = find_subtitle_file(temp_dir, video.id, lang)
+                    transcript_text = parse_subtitle_file(subtitle_file) if subtitle_file else None
+
+                    if transcript_text:
+                        video.transcript_status = "success"
+                        transcript_data = {
+                            "video_id": video.id,
+                            "title": video.title,
+                            "url": video.url,
+                            "upload_date": video.upload_date,
+                            "duration": video.duration,
+                            "transcript": transcript_text,
+                            "word_count": len(transcript_text.split()),
+                            "scraped_at": datetime.now().isoformat()
+                        }
+                        transcript_path = transcripts_dir / f"{video.id}.json"
+                        transcript_path.write_text(json.dumps(transcript_data, indent=2, ensure_ascii=False))
+                        results["success"] += 1
+                        logger.info(f"  ✓ Saved transcript ({len(transcript_text.split())} words)")
+                    elif rate_limited and attempt <= MAX_RETRIES:
+                        retry_list.append(video)
+                        continue
+                    else:
+                        if not ok and batch_error:
+                            video.transcript_status = "error"
+                            video.error_message = batch_error
+                            results["error"] += 1
+                            logger.warning(f"  ✗ Error: {batch_error}")
+                        elif rate_limited:
+                            video.transcript_status = "error"
+                            video.error_message = "Rate limited (batch)"
+                            results["error"] += 1
+                            logger.warning("  ✗ Error: Rate limited (batch)")
+                        else:
+                            video.transcript_status = "no_transcript"
+                            video.error_message = "No subtitles available"
+                            results["no_transcript"] += 1
+                            logger.info("  ⊘ No transcript available")
+
+                    processed_videos[video.id] = asdict(video)
+                    processed_count += 1
+                    if processed_count % 10 == 0:
+                        save_index(index_path, channel_info, processed_videos, results)
+
+            if retry_list and rate_limited and attempt <= MAX_RETRIES:
+                rate_limit_hits += 1
+                backoff = min(
+                    RATE_LIMIT_BACKOFF_MAX,
+                    RATE_LIMIT_BACKOFF_BASE * (2 ** min(rate_limit_hits - 1, 4))
+                )
+                logger.warning(
+                    f"Rate limited; backing off {backoff:.0f}s and retrying batch "
+                    f"(attempt {attempt}/{MAX_RETRIES})"
+                )
+                time.sleep(backoff)
+                remaining = retry_list
+                continue
+
+            remaining = retry_list
+
+    else:
+        attempts = {video.id: 0 for video in pending_videos}
+        max_workers = max(1, min(int(max_workers), MAX_WORKERS))
+        logger.info(f"Starting downloads with up to {max_workers} concurrent workers")
+
+        in_flight = {}
+        started_count = 0
+        rate_limit_hits = 0
+        cooldown_until = 0.0
+        last_submit_time = 0.0
+        concurrency = max_workers
+
+        def worker(video_info: VideoInfo) -> dict:
+            transcript_path = transcripts_dir / f"{video_info.id}.json"
+            success, transcript, error, rate_limited = download_transcript(video_info.id, transcript_path, lang)
+            return {
+                "video": video_info,
+                "success": success,
                 "transcript": transcript,
-                "word_count": len(transcript.split()),
-                "scraped_at": datetime.now().isoformat()
+                "error": error,
+                "rate_limited": rate_limited
             }
-            transcript_path.write_text(json.dumps(transcript_data, indent=2, ensure_ascii=False))
-            
-            results["success"] += 1
-            logger.info(f"  ✓ Saved transcript ({len(transcript.split())} words)")
-            
-        elif error and "No subtitles" in error:
-            video.transcript_status = "no_transcript"
-            video.error_message = error
-            results["no_transcript"] += 1
-            logger.info(f"  ⊘ No transcript available")
-            
-        else:
-            video.transcript_status = "error"
-            video.error_message = error
-            results["error"] += 1
-            logger.warning(f"  ✗ Error: {error}")
-        
-        processed_videos[video.id] = asdict(video)
-        
-        # Save index periodically (every 10 videos)
-        if i % 10 == 0:
-            save_index(index_path, channel_info, processed_videos, results)
-        
-        # Rate limiting
-        time.sleep(delay)
+
+        def submit_video(executor: ThreadPoolExecutor, video_info: VideoInfo):
+            nonlocal started_count, last_submit_time
+            # Global cooldown if rate limited
+            if time.time() < cooldown_until:
+                time.sleep(max(0.0, cooldown_until - time.time()))
+
+            # Throttle submission cadence
+            if delay > 0:
+                since_last = time.time() - last_submit_time if last_submit_time else None
+                if since_last is not None and since_last < delay:
+                    time.sleep(delay - since_last)
+            last_submit_time = time.time()
+
+            started_count += 1
+            logger.info(f"[{started_count}/{len(videos)}] Processing: {video_info.title[:50]}...")
+            future = executor.submit(worker, video_info)
+            in_flight[future] = video_info
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            while pending_videos or in_flight:
+                while pending_videos and len(in_flight) < concurrency:
+                    submit_video(executor, pending_videos.popleft())
+
+                if not in_flight:
+                    continue
+
+                done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
+                for future in done:
+                    video = in_flight.pop(future)
+                    try:
+                        result = future.result()
+                    except Exception as e:
+                        video.transcript_status = "error"
+                        video.error_message = f"Worker error: {e}"
+                        results["error"] += 1
+                        processed_videos[video.id] = asdict(video)
+                        processed_count += 1
+                        continue
+
+                    if result["rate_limited"]:
+                        attempts[video.id] += 1
+                        if attempts[video.id] <= MAX_RETRIES:
+                            rate_limit_hits += 1
+                            concurrency = max(1, concurrency - 1)
+                            backoff = min(
+                                RATE_LIMIT_BACKOFF_MAX,
+                                RATE_LIMIT_BACKOFF_BASE * (2 ** min(rate_limit_hits - 1, 4))
+                            )
+                            cooldown_until = max(cooldown_until, time.time() + backoff)
+                            logger.warning(
+                                f"Rate limited; backing off {backoff:.0f}s and reducing workers to {concurrency} "
+                                f"(retry {attempts[video.id]}/{MAX_RETRIES})"
+                            )
+                            pending_videos.append(video)
+                            continue
+                        else:
+                            result["error"] = result["error"] or "Rate limited (max retries exceeded)"
+
+                    if result["success"] and result["transcript"]:
+                        video.transcript_status = "success"
+                        transcript_text = result["transcript"]
+
+                        # Save transcript with metadata
+                        transcript_data = {
+                            "video_id": video.id,
+                            "title": video.title,
+                            "url": video.url,
+                            "upload_date": video.upload_date,
+                            "duration": video.duration,
+                            "transcript": transcript_text,
+                            "word_count": len(transcript_text.split()),
+                            "scraped_at": datetime.now().isoformat()
+                        }
+                        transcript_path = transcripts_dir / f"{video.id}.json"
+                        transcript_path.write_text(json.dumps(transcript_data, indent=2, ensure_ascii=False))
+
+                        results["success"] += 1
+                        logger.info(f"  ✓ Saved transcript ({len(transcript_text.split())} words)")
+
+                    elif result["error"] and "No subtitles" in result["error"]:
+                        video.transcript_status = "no_transcript"
+                        video.error_message = result["error"]
+                        results["no_transcript"] += 1
+                        logger.info(f"  ⊘ No transcript available")
+
+                    else:
+                        video.transcript_status = "error"
+                        video.error_message = result["error"]
+                        results["error"] += 1
+                        logger.warning(f"  ✗ Error: {result['error']}")
+
+                    processed_videos[video.id] = asdict(video)
+                    processed_count += 1
+
+                    # Save index periodically (every 10 processed videos)
+                    if processed_count % 10 == 0:
+                        save_index(index_path, channel_info, processed_videos, results)
     
     # Final save
     save_index(index_path, channel_info, processed_videos, results)
@@ -503,8 +780,6 @@ def scrape_channel(
     logger.info(f"  No transcript: {results['no_transcript']}")
     logger.info(f"  Errors: {results['error']}")
     logger.info(f"  Skipped (resumed): {results['skipped']}")
-    if results.get('shorts_skipped'):
-        logger.info(f"  Shorts skipped: {results['shorts_skipped']}")
     logger.info(f"  Output directory: {output_dir}")
     if combined_path:
         logger.info(f"  LLM-ready file: {combined_path}")
@@ -599,11 +874,14 @@ def generate_combined_transcript(output_dir: Path, channel_info: Optional[Channe
                     lines.append(f"Date: {formatted}")
             except:
                 lines.append(f"Date: {entry['upload_date']}")
-        if entry.get("duration"):
-            duration = int(entry["duration"])
-            mins = duration // 60
-            secs = duration % 60
-            lines.append(f"Duration: {mins}:{secs:02d}")
+        if entry.get("duration") is not None:
+            try:
+                duration = int(entry["duration"])
+                mins = duration // 60
+                secs = duration % 60
+                lines.append(f"Duration: {mins}:{secs:02d}")
+            except (TypeError, ValueError):
+                pass
         lines.append(f"Words: {entry['word_count']:,}")
         lines.append("")
         lines.append(entry["transcript"])
@@ -630,6 +908,7 @@ Examples:
     %(prog)s https://www.youtube.com/@channelname
     %(prog)s UCxxxxxxxxxx --output-dir ./my_transcripts
     %(prog)s @channelhandle --lang es --resume
+    %(prog)s @channelhandle --mode batch
         """
     )
     
@@ -671,23 +950,32 @@ Examples:
     )
 
     parser.add_argument(
-        "--include-shorts",
-        action="store_true",
-        help="Include YouTube Shorts (default: skip shorts)"
+        "--max-workers",
+        type=int,
+        default=MAX_WORKERS,
+        choices=range(1, MAX_WORKERS + 1),
+        help=f"Max concurrent workers (1-{MAX_WORKERS}, default: {MAX_WORKERS})"
     )
 
+    parser.add_argument(
+        "--mode",
+        choices=["per-video", "batch"],
+        default="per-video",
+        help="Download mode: per-video (parallel) or batch (single yt-dlp run)"
+    )
+    
     args = parser.parse_args()
-
+    
     resume = not args.no_resume
-    skip_shorts = not args.include_shorts
-
+    
     result = scrape_channel(
         channel_url=args.channel,
         output_dir=Path(args.output_dir),
         lang=args.lang,
         resume=resume,
         delay=args.delay,
-        skip_shorts=skip_shorts
+        max_workers=args.max_workers,
+        mode=args.mode
     )
     
     if "error" in result:

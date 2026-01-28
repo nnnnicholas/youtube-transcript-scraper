@@ -19,6 +19,8 @@ all_transcripts.txt
 
 # Temp files
 .temp/
+.temp_*
+.batch_subs_*
 *.tmp
 .DS_Store
 

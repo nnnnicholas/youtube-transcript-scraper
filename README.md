@@ -13,7 +13,7 @@ Scrape all video transcripts from a YouTube channel into a single text file you 
 
 ```bash
 # Clone and run
-git clone https://github.com/nicholasgriffintn/youtube-transcript-scraper.git
+git clone https://github.com/nnnnicholas/youtube-transcript-scraper.git
 cd youtube-transcript-scraper
 
 python scripts/scrape_channel.py https://www.youtube.com/@channelname
@@ -74,6 +74,9 @@ python scripts/scrape_channel.py @channelname --no-resume
 
 # Faster (but may get rate-limited)
 python scripts/scrape_channel.py @channelname --delay 0.5
+
+# Batch mode (single yt-dlp run)
+python scripts/scrape_channel.py @channelname --mode batch
 ```
 
 ### Input formats
@@ -92,15 +95,20 @@ All of these work:
 | `--output-dir`, `-o` | Output directory | `./transcripts` |
 | `--lang`, `-l` | Preferred language code | `en` |
 | `--delay`, `-d` | Seconds between requests | `1.0` |
+| `--max-workers` | Max concurrent workers (1-3) | `3` |
+| `--mode` | Download mode: `per-video` or `batch` | `per-video` |
 | `--no-resume` | Re-download everything | (resume enabled) |
-| `--include-shorts` | Include YouTube Shorts | (shorts skipped) |
+
+**Note:** Shorts and short videos are skipped by default (detected by `/shorts/` URLs, `#shorts` titles, or duration < 4 minutes).
 
 ## Features
 
 - **Resume support**: Interrupted? Just run again - skips already downloaded videos
 - **Auto-generated captions**: Falls back to auto-captions when manual aren't available
 - **Progress saving**: Saves every 10 videos in case of interruption
-- **Rate limiting**: Configurable delay to avoid getting blocked
+- **Parallel downloads**: Up to 3 workers with backoff and retry on rate limits
+- **Batch mode**: Single yt-dlp run for faster downloads on some channels
+- **Skips shorts**: Shorts and videos under 4 minutes are excluded by default
 
 ## Use cases
 
