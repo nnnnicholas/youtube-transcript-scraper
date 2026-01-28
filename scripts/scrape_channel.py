@@ -40,7 +40,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Concurrency/rate-limit defaults
-MAX_WORKERS = 3
+DEFAULT_MAX_WORKERS = 3
 MAX_RETRIES = 3
 RATE_LIMIT_BACKOFF_BASE = 10.0  # seconds
 RATE_LIMIT_BACKOFF_MAX = 120.0  # seconds
@@ -485,7 +485,7 @@ def scrape_channel(
     lang: str = "en",
     resume: bool = True,
     delay: float = 1.0,
-    max_workers: int = MAX_WORKERS,
+    max_workers: int = DEFAULT_MAX_WORKERS,
     mode: str = "per-video"
 ) -> dict:
     """
@@ -647,7 +647,7 @@ def scrape_channel(
 
     else:
         attempts = {video.id: 0 for video in pending_videos}
-        max_workers = max(1, min(int(max_workers), MAX_WORKERS))
+        max_workers = max(1, int(max_workers))
         logger.info(f"Starting downloads with up to {max_workers} concurrent workers")
 
         in_flight = {}
@@ -952,9 +952,8 @@ Examples:
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=MAX_WORKERS,
-        choices=range(1, MAX_WORKERS + 1),
-        help=f"Max concurrent workers (1-{MAX_WORKERS}, default: {MAX_WORKERS})"
+        default=DEFAULT_MAX_WORKERS,
+        help=f"Max concurrent workers (default: {DEFAULT_MAX_WORKERS})"
     )
 
     parser.add_argument(

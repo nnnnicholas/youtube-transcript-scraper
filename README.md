@@ -95,7 +95,7 @@ All of these work:
 | `--output-dir`, `-o` | Output directory | `./transcripts` |
 | `--lang`, `-l` | Preferred language code | `en` |
 | `--delay`, `-d` | Seconds between requests | `1.0` |
-| `--max-workers` | Max concurrent workers (1-3) | `3` |
+| `--max-workers` | Max concurrent workers | `3` |
 | `--mode` | Download mode: `per-video` or `batch` | `per-video` |
 | `--no-resume` | Re-download everything | (resume enabled) |
 
@@ -106,7 +106,7 @@ All of these work:
 - **Resume support**: Interrupted? Just run again - skips already downloaded videos
 - **Auto-generated captions**: Falls back to auto-captions when manual aren't available
 - **Progress saving**: Saves every 10 videos in case of interruption
-- **Parallel downloads**: Up to 3 workers with backoff and retry on rate limits
+- **Parallel downloads**: Configurable workers (default 3) with backoff and retry on rate limits
 - **Batch mode**: Single yt-dlp run for faster downloads on some channels
 - **Skips shorts**: Shorts and videos under 4 minutes are excluded by default
 

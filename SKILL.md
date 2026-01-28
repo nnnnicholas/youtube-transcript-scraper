@@ -23,7 +23,7 @@ python scripts/scrape_channel.py <channel_url_or_id> --output-dir ./output
 - Downloads manual captions when available, falls back to auto-generated
 - Resumes from previous runs (skips already downloaded)
 - Rate limiting to avoid being blocked
-- Parallel downloads (up to 3 workers) with backoff on rate limits
+- Parallel downloads (default 3 workers) with backoff on rate limits
 - Skips YouTube Shorts and short videos (<4 minutes)
 - Optional batch mode (single yt-dlp run) for faster downloads
 - Structured JSON output with metadata
@@ -61,7 +61,7 @@ Each transcript file contains:
 | `--output-dir`, `-o` | Output directory | `./transcripts` |
 | `--lang`, `-l` | Preferred language code | `en` |
 | `--delay`, `-d` | Seconds between requests | `1.0` |
-| `--max-workers` | Max concurrent workers (1-3) | `3` |
+| `--max-workers` | Max concurrent workers | `3` |
 | `--mode` | Download mode: `per-video` or `batch` | `per-video` |
 | `--no-resume` | Re-download everything | (resume enabled) |
 
