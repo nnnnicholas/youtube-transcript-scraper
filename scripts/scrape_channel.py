@@ -130,6 +130,52 @@ def normalize_channel_url(channel_input: str, videos_only: bool = True) -> str:
     return f"https://www.youtube.com/@{channel_input}{suffix}"
 
 
+def infer_channel_name_from_url(channel_url: str) -> str:
+    """Best-effort channel name from a channel URL/handle."""
+    parsed = urlparse(channel_url)
+    path = parsed.path.strip("/")
+    if not path:
+        return "YouTube Channel"
+
+    parts = [p for p in path.split("/") if p]
+    if not parts:
+        return "YouTube Channel"
+
+    if parts[-1] in {
+        "videos",
+        "shorts",
+        "streams",
+        "playlists",
+        "featured",
+        "community",
+        "live",
+        "releases",
+    }:
+        parts = parts[:-1]
+
+    if not parts:
+        return "YouTube Channel"
+
+    candidate = parts[0]
+    if candidate in {"channel", "c", "user"} and len(parts) >= 2:
+        candidate = parts[1]
+
+    if candidate.startswith("@"):
+        candidate = candidate[1:]
+
+    candidate = candidate.strip()
+    return candidate or "YouTube Channel"
+
+
+def pick_channel_name(data: dict, channel_url: str) -> str:
+    """Pick the most reliable channel name available."""
+    for key in ("channel", "uploader", "uploader_id", "channel_id"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return infer_channel_name_from_url(channel_url)
+
+
 def is_short_entry(data: dict) -> bool:
     """Heuristic to identify YouTube Shorts or short-form videos."""
     for key in ("webpage_url", "url", "original_url"):
@@ -196,7 +242,7 @@ def get_channel_videos(channel_url: str) -> tuple[Optional[ChannelInfo], list[Vi
                 if channel_info is None and "channel_id" in data:
                     channel_info = ChannelInfo(
                         id=data.get("channel_id", "unknown"),
-                        name=data.get("channel", data.get("uploader", "Unknown Channel")),
+                        name=pick_channel_name(data, channel_url),
                         url=channel_url,
                         video_count=0,  # Will update after
                         scraped_at=datetime.now().isoformat()
@@ -850,7 +896,10 @@ def generate_combined_transcript(output_dir: Path, channel_info: Optional[Channe
     lines = []
 
     # Header
-    channel_name = channel_info.name if channel_info else "YouTube Channel"
+    if channel_info:
+        channel_name = channel_info.name or infer_channel_name_from_url(channel_info.url)
+    else:
+        channel_name = "YouTube Channel"
     lines.append(f"# {channel_name} - Complete Transcripts")
     lines.append(f"")
     lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
