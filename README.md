@@ -93,6 +93,7 @@ All of these work:
 | `--lang`, `-l` | Preferred language code | `en` |
 | `--delay`, `-d` | Seconds between requests | `1.0` |
 | `--no-resume` | Re-download everything | (resume enabled) |
+| `--include-shorts` | Include YouTube Shorts | (shorts skipped) |
 
 ## Features
 

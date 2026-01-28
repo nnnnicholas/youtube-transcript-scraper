@@ -356,18 +356,20 @@ def scrape_channel(
     output_dir: Path,
     lang: str = "en",
     resume: bool = True,
-    delay: float = 1.0
+    delay: float = 1.0,
+    skip_shorts: bool = True
 ) -> dict:
     """
     Main function to scrape all transcripts from a channel.
-    
+
     Args:
         channel_url: YouTube channel URL or ID
         output_dir: Directory to save transcripts
         lang: Preferred language code
         resume: Skip already downloaded transcripts
         delay: Delay between requests (seconds)
-    
+        skip_shorts: Skip YouTube Shorts (videos < 90s or with #short in title)
+
     Returns:
         Summary dict with results
     """
@@ -411,14 +413,29 @@ def scrape_channel(
         "success": 0,
         "no_transcript": 0,
         "error": 0,
-        "skipped": 0
+        "skipped": 0,
+        "shorts_skipped": 0
     }
-    
+
     processed_videos = {}
-    
+
     for i, video in enumerate(videos, 1):
+        # Skip YouTube Shorts
+        if skip_shorts:
+            is_short = False
+            title_lower = video.title.lower()
+            if "#short" in title_lower or "#shorts" in title_lower:
+                is_short = True
+            elif video.duration and video.duration < 90:
+                is_short = True
+
+            if is_short:
+                logger.info(f"[{i}/{len(videos)}] Skipping short: {video.title[:50]}...")
+                results["shorts_skipped"] += 1
+                continue
+
         logger.info(f"[{i}/{len(videos)}] Processing: {video.title[:50]}...")
-        
+
         # Check if already processed
         if resume and video.id in existing_index.get("videos", {}):
             prev_status = existing_index["videos"][video.id].get("transcript_status")
@@ -486,6 +503,8 @@ def scrape_channel(
     logger.info(f"  No transcript: {results['no_transcript']}")
     logger.info(f"  Errors: {results['error']}")
     logger.info(f"  Skipped (resumed): {results['skipped']}")
+    if results.get('shorts_skipped'):
+        logger.info(f"  Shorts skipped: {results['shorts_skipped']}")
     logger.info(f"  Output directory: {output_dir}")
     if combined_path:
         logger.info(f"  LLM-ready file: {combined_path}")
@@ -581,8 +600,9 @@ def generate_combined_transcript(output_dir: Path, channel_info: Optional[Channe
             except:
                 lines.append(f"Date: {entry['upload_date']}")
         if entry.get("duration"):
-            mins = entry["duration"] // 60
-            secs = entry["duration"] % 60
+            duration = int(entry["duration"])
+            mins = duration // 60
+            secs = duration % 60
             lines.append(f"Duration: {mins}:{secs:02d}")
         lines.append(f"Words: {entry['word_count']:,}")
         lines.append("")
@@ -649,17 +669,25 @@ Examples:
         default=1.0,
         help="Delay between requests in seconds (default: 1.0)"
     )
-    
+
+    parser.add_argument(
+        "--include-shorts",
+        action="store_true",
+        help="Include YouTube Shorts (default: skip shorts)"
+    )
+
     args = parser.parse_args()
-    
+
     resume = not args.no_resume
-    
+    skip_shorts = not args.include_shorts
+
     result = scrape_channel(
         channel_url=args.channel,
         output_dir=Path(args.output_dir),
         lang=args.lang,
         resume=resume,
-        delay=args.delay
+        delay=args.delay,
+        skip_shorts=skip_shorts
     )
     
     if "error" in result:
