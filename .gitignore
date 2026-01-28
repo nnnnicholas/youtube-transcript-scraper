@@ -12,8 +12,10 @@ ENV/
 transcripts/
 *-transcripts/
 output/
+test-output/
 *.json
 !references/*.json
+all_transcripts.txt
 
 # Temp files
 .temp/
